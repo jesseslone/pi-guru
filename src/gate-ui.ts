@@ -17,9 +17,10 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 import type { ExplainStep } from "./explain.ts";
+import type { GateLevel } from "./gate-level.ts";
 import type { SpokenLevel } from "./levels.ts";
 
-export type GateChoice = "explain" | "approve" | "approve-session" | "deny" | "deny-reason";
+export type GateChoice = "explain" | "approve" | "approve-session" | "deny" | "deny-reason" | "change-level";
 
 export interface GateItem {
 	value: GateChoice;
@@ -49,13 +50,17 @@ export interface GateOptions {
 	explainer?: Explainer;
 	/** The level the first explanation is given at — shown as the Explain description. */
 	startLevel?: SpokenLevel;
+	/** The current session gate level — marks "(current)" in the second menu. */
+	gateLevel?: GateLevel;
 }
 
 /** The person's decision, normalized for the pipeline. */
 export type GateResult =
 	| { decision: "approve" }
 	| { decision: "approve-session" }
-	| { decision: "deny"; reason: string };
+	| { decision: "deny"; reason: string }
+	/** The person chose a new session gate level from the gate's second menu. */
+	| { decision: "change-level"; level: GateLevel };
 
 const BASE_ITEMS: GateItem[] = [
 	{ value: "approve", label: "Approve", description: "Run this once" },
@@ -64,14 +69,30 @@ const BASE_ITEMS: GateItem[] = [
 	{ value: "deny-reason", label: "Deny with a reason", description: "Tell the agent why" },
 ];
 
+/** The gate's last choice: opens the second menu. Below Deny, never the default. */
+const CHANGE_LEVEL_ITEM: GateItem = {
+	value: "change-level",
+	label: "Change how pi-guru asks…",
+	description: "Let the judge approve, or stop asking, this session",
+};
+
 /**
  * The gate choices. With `explain` true, Explain is prepended as the first choice (issue
- * #2); otherwise the four base choices stand, with Approve first.
+ * #2); otherwise the four base choices stand, with Approve first. With `changeLevel`
+ * true, "Change how pi-guru asks…" is appended as the last choice.
  */
-export function gateItems(explain = false, startLevel?: SpokenLevel): GateItem[] {
-	if (!explain) return [...BASE_ITEMS];
-	const description = startLevel ? `Plain-language account (${startLevel})` : "Plain-language account";
-	return [{ value: "explain", label: "Explain", description }, ...BASE_ITEMS];
+export function gateItems(explain = false, startLevel?: SpokenLevel, changeLevel = false): GateItem[] {
+	const head: GateItem[] = explain
+		? [
+				{
+					value: "explain",
+					label: "Explain",
+					description: startLevel ? `Plain-language account (${startLevel})` : "Plain-language account",
+				},
+			]
+		: [];
+	const tail: GateItem[] = changeLevel ? [CHANGE_LEVEL_ITEM] : [];
+	return [...head, ...BASE_ITEMS, ...tail];
 }
 
 /** Index the default cursor should sit on: Explain before any explanation, else Approve. */
@@ -90,12 +111,90 @@ export async function presentGate(
 	request: GateRequest,
 	opts: GateOptions = {},
 ): Promise<GateResult> {
-	const items = gateItems(Boolean(opts.explainer), opts.startLevel);
-	const choice =
-		ctx.mode === "tui"
-			? await presentCustom(ctx, request, items, opts.explainer)
-			: await presentSelect(ctx, request, items, opts.explainer);
-	return interpret(ctx, choice);
+	const items = gateItems(Boolean(opts.explainer), opts.startLevel, true);
+	// Loop so the second menu's "Back"/cancel — and an unconfirmed "stop asking" — return to the
+	// gate rather than deciding the call.
+	while (true) {
+		const choice =
+			ctx.mode === "tui"
+				? await presentCustom(ctx, request, items, opts.explainer)
+				: await presentSelect(ctx, request, items, opts.explainer);
+		if (choice !== "change-level") return interpret(ctx, choice);
+
+		const level = await presentLevelMenu(ctx, opts.gateLevel ?? "ask");
+		if (level === undefined || level === "back") continue; // back to the gate
+		if (level === "off" && !(await confirmStopAsking(ctx))) continue; // off needs the typed phrase
+		return { decision: "change-level", level };
+	}
+}
+
+/** The second menu's items, marking the current session level. */
+function levelItems(current: GateLevel): { value: GateLevel | "back"; label: string }[] {
+	const mark = (level: GateLevel, base: string) => (level === current ? `${base} (current)` : base);
+	return [
+		{ value: "ask", label: mark("ask", "Keep asking") },
+		{ value: "auto-low", label: mark("auto-low", "Let the judge approve low-risk changes this session") },
+		{ value: "auto-medium", label: mark("auto-medium", "Let the judge approve low and medium this session") },
+		{ value: "off", label: mark("off", "Stop asking this session (hard denies stay)") },
+		{ value: "back", label: "Back" },
+	];
+}
+
+/**
+ * The gate's second menu: "Change how pi-guru asks…". A `ctx.ui.custom` SelectList in
+ * TUI so it renders like the gate; a `ctx.ui.select` fallback elsewhere. Returns the chosen gate
+ * level, or "back"/undefined to return to the gate.
+ */
+async function presentLevelMenu(
+	ctx: GateContext,
+	current: GateLevel,
+): Promise<GateLevel | "back" | undefined> {
+	const items = levelItems(current);
+	const title = "Change how pi-guru asks…";
+	if (ctx.mode !== "tui") {
+		const picked = await ctx.ui.select(
+			title,
+			items.map((it) => it.label),
+		);
+		if (picked === undefined) return undefined;
+		return items.find((it) => it.label === picked)?.value ?? "back";
+	}
+	const selectItems: SelectItem[] = items.map((it) => ({ value: it.value, label: it.label }));
+	const result = await ctx.ui.custom<GateLevel | "back">((tui, theme, _kb, done) => {
+		const list = new SelectList(selectItems, Math.min(selectItems.length, 10), {
+			selectedPrefix: (t) => theme.fg("accent", t),
+			selectedText: (t) => theme.fg("accent", t),
+			description: (t) => theme.fg("muted", t),
+			scrollInfo: (t) => theme.fg("dim", t),
+			noMatch: (t) => theme.fg("warning", t),
+		});
+		list.onSelect = (item) => done(item.value as GateLevel | "back");
+		list.onCancel = () => done("back"); // esc = back to the gate
+		const container = new Container();
+		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+		container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+		container.addChild(list);
+		container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter select • esc back"), 1, 0));
+		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+		return {
+			render: (w: number) => container.render(w),
+			invalidate: () => container.invalidate(),
+			handleInput: (data: string) => {
+				list.handleInput(data);
+				tui.requestRender();
+			},
+		};
+	});
+	return result ?? "back";
+}
+
+/**
+ * The typed confirmation the `off` level requires before it takes effect: the person
+ * must type `stop asking`. Shared by the gate's second menu and the `/gate level off` command.
+ */
+export async function confirmStopAsking(ctx: GateContext): Promise<boolean> {
+	const typed = await ctx.ui.input("Type 'stop asking' to stop pi-guru asking this session", "stop asking");
+	return typed?.trim().toLowerCase() === "stop asking";
 }
 
 /** TUI path: a re-rendering component with the Explain loop and a preselected default. */

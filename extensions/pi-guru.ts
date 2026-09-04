@@ -40,10 +40,23 @@ import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { SessionAllows } from "../src/allows.ts";
 import { type AssessResult, assess, floorDecision, renderFactsBlock } from "../src/assess/index.ts";
 import { classifyTool } from "../src/classify.ts";
-import { loadEffectiveConfig, type PiGuruConfig, setJudgeInConfig, setLevelInConfig } from "../src/config.ts";
+import {
+	loadEffectiveConfig,
+	loadProjectConfigFile,
+	type PiGuruConfig,
+	setJudgeInConfig,
+	setLevelInConfig,
+} from "../src/config.ts";
 import { makeExplainer } from "../src/explain.ts";
 import { randomNonce } from "../src/fence.ts";
-import { type GateOptions, presentGate } from "../src/gate-ui.ts";
+import {
+	ALL_GATE_LEVELS,
+	type GateLevel,
+	isGateLevel,
+	type ProjectJudgeView,
+	resolveSessionJudge,
+} from "../src/gate-level.ts";
+import { confirmStopAsking, type GateOptions, presentGate } from "../src/gate-ui.ts";
 import { writeHandoff } from "../src/handoff.ts";
 import { buildRules } from "../src/hard-deny.ts";
 import {
@@ -68,6 +81,7 @@ import {
 	type EntryKind,
 	type JudgeStage,
 	type NormalizedCall,
+	type PipelineDeps,
 	runPipeline,
 } from "../src/pipeline.ts";
 import { detectSandbox } from "../src/sandbox.ts";
@@ -88,6 +102,13 @@ interface SpeechEntry {
 	level: string;
 	markdown: string;
 	tokens: number;
+	timestamp: number;
+}
+
+/** A session entry recording a change to the session gate level. */
+interface GateLevelEntry {
+	level: GateLevel;
+	detail: string;
 	timestamp: number;
 }
 
@@ -129,12 +150,60 @@ export default function (pi: ExtensionAPI) {
 	// One nonce for the whole pi session, so the `prefix-stable` judge layout's fenced-transcript
 	// prefix stays byte-identical (hence cacheable) as the transcript grows. Unused by `current`.
 	const judgeSessionNonce = randomNonce();
+	// The session gate level: how much pi-guru asks this session. Runtime-only, never
+	// persisted; a new session starts at `ask` (so production is byte-identical without a change).
+	let gateLevel: GateLevel = "ask";
 
 	for (const kind of ["hard-deny", "decision", "handoff", "auto-approve", "standdown"] as EntryKind[]) {
 		registerDecisionRenderer(pi, kind);
 	}
 	registerSpeechRenderer(pi, "explain");
 	registerSpeechRenderer(pi, "narration");
+	registerGateLevelRenderer(pi);
+
+	/** The project config's judge fields, for the gate-level cap; undefined in an untrusted repo. */
+	const projectJudgeView = (ctx: ExtensionContext): ProjectJudgeView | undefined => {
+		if (!ctx.isProjectTrusted()) return undefined;
+		return loadProjectConfigFile(join(ctx.cwd, CONFIG_DIR_NAME, "pi-guru.json"));
+	};
+
+	/**
+	 * Apply a requested session gate level: resolve the project cap, require a model for
+	 * an auto level (else stay put), then set the level, record a `pi-guru:gate-level` entry, and
+	 * refresh the status line. The `off` typed confirmation is the caller's job. Returns whether the
+	 * level changed. Shared by the gate's second menu and `/gate level`.
+	 */
+	const applyLevel = (ctx: ExtensionContext, requested: GateLevel, config: PiGuruConfig): boolean => {
+		const resolve = resolveSessionJudge(requested, config, projectJudgeView(ctx));
+		const auto = resolve.appliedLevel === "auto-low" || resolve.appliedLevel === "auto-medium";
+		if (auto && !pickSessionModel(ctx)) {
+			ctx.ui.notify(`pi-guru: no session model available — staying at ${gateLevel}`, "warning");
+			return false;
+		}
+		gateLevel = resolve.appliedLevel;
+		if (resolve.capped) {
+			ctx.ui.notify(
+				`pi-guru: this project caps the gate level at ${resolve.appliedLevel} (requested ${requested})`,
+				"info",
+			);
+		}
+		pi.appendEntry<GateLevelEntry>(`${ENTRY_PREFIX}:gate-level`, {
+			level: gateLevel,
+			detail: resolve.capped
+				? `session gate level set to ${gateLevel} (capped from ${requested} by this project) — resets when the session ends`
+				: `session gate level set to ${gateLevel} — resets when the session ends`,
+			timestamp: Date.now(),
+		});
+		updateStatus(
+			ctx,
+			gateLevel,
+			effectiveJudgeMode(resolve.mode, judge.breaker.tripped),
+			resolve.threshold,
+			judge.counts,
+		);
+		ctx.ui.notify(`pi-guru: gate level set to ${gateLevel}`, "info");
+		return true;
+	};
 
 	pi.on("tool_call", async (event, ctx) => {
 		try {
@@ -150,6 +219,20 @@ export default function (pi: ExtensionAPI) {
 			const call = normalize(event);
 			const rules = buildRules(config.hardDeny);
 
+			// The project judge view (for the gate-level cap) is read once per call; the status line
+			// reflects the live session gate level and its resolved judge mode/threshold.
+			const projectView = projectJudgeView(ctx);
+			const refreshStatus = () => {
+				const r = resolveSessionJudge(gateLevel, config, projectView);
+				updateStatus(
+					ctx,
+					gateLevel,
+					effectiveJudgeMode(r.mode, judge.breaker.tripped),
+					r.threshold,
+					judge.counts,
+				);
+			};
+
 			// The standdown entry is recorded once per session; a gate denial counts toward the
 			// judge stats (status line + /judge). Shared by both branches below.
 			const appendEntry = (kind: EntryKind, data: EntryData) => {
@@ -159,12 +242,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (kind === "decision" && data.outcome === "denied") {
 					judge.counts.denied++;
-					updateStatus(
-						ctx,
-						effectiveJudgeMode(config.judgeMode, judge.breaker.tripped),
-						config.judgeThreshold,
-						judge.counts,
-					);
+					refreshStatus();
 				}
 				pi.appendEntry(`${ENTRY_PREFIX}:${kind}`, data);
 			};
@@ -197,19 +275,40 @@ export default function (pi: ExtensionAPI) {
 				? renderFactsBlock(assessment.facts, assessment.unresolved)
 				: undefined;
 			const gateOptions = buildGateOptions(pi, ctx, config.level, call, notified, factsBlock);
-			const effMode = effectiveJudgeMode(config.judgeMode, judge.breaker.tripped);
-			updateStatus(ctx, effMode, config.judgeThreshold, judge.counts);
 
-			return await runPipeline(call, {
-				rules,
-				allows,
-				cwd: ctx.cwd,
-				hasUI: ctx.hasUI,
-				judge: buildJudgeStage(ctx, config, call, judge, effMode, judgeSessionNonce, assessment, factsBlock),
-				gate: (req) => presentGate(ctx, req, gateOptions),
-				writeHandoff: (details) => writeHandoff(ctx.cwd, details).path,
-				appendEntry,
-			});
+			// Build the deps for the current session gate level. `applyGateLevel` re-runs
+			// this same builder after a level change, so the pending call is re-evaluated under the new
+			// level through the pipeline. At `ask` this resolves to the config's own judge (byte-identical).
+			const buildPipelineDeps = (): PipelineDeps => {
+				const resolve = resolveSessionJudge(gateLevel, config, projectView);
+				const effMode = effectiveJudgeMode(resolve.mode, judge.breaker.tripped);
+				refreshStatus();
+				return {
+					rules,
+					allows,
+					cwd: ctx.cwd,
+					hasUI: ctx.hasUI,
+					gateOff: resolve.gateOff,
+					judge: buildJudgeStage(
+						ctx,
+						config,
+						call,
+						judge,
+						effMode,
+						resolve.threshold,
+						judgeSessionNonce,
+						assessment,
+						factsBlock,
+						refreshStatus,
+					),
+					gate: (req) => presentGate(ctx, req, { ...gateOptions, gateLevel }),
+					applyGateLevel: (requested) => (applyLevel(ctx, requested, config) ? buildPipelineDeps() : null),
+					writeHandoff: (details) => writeHandoff(ctx.cwd, details).path,
+					appendEntry,
+				};
+			};
+
+			return await runPipeline(call, buildPipelineDeps());
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			return { block: true, reason: `pi-guru: blocked for safety after an internal error (${message})` };
@@ -285,9 +384,15 @@ export default function (pi: ExtensionAPI) {
 		handler: showOrSetLevel,
 	});
 
-	// /gate — list session allows; /gate clear — clear them.
+	// /gate — list session allows and the session gate level; `/gate clear` clears the allows;
+	// `/gate level [ask|auto-low|auto-medium|off]` shows or sets the gate level.
 	pi.registerCommand("gate", {
-		description: "Show pi-guru session allows; `/gate clear` clears them",
+		description:
+			"Show pi-guru session allows and gate level; `/gate clear`; `/gate level [ask|auto-low|auto-medium|off]`",
+		getArgumentCompletions: (prefix) => {
+			const options = ["clear", "level", ...ALL_GATE_LEVELS];
+			return options.filter((o) => o.startsWith(prefix)).map((o) => ({ value: o, label: o }));
+		},
 		handler: async (args, ctx) => {
 			if (sandbox.active) {
 				ctx.ui.setStatus("pi-guru", "sandboxed");
@@ -297,23 +402,55 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			if (args.trim() === "clear") {
+			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			if (tokens[0] === "level") {
+				await gateLevelCommand(ctx, tokens[1]);
+				return;
+			}
+			if (tokens[0] === "clear") {
 				allows.clear();
 				ctx.ui.notify("pi-guru: session allows cleared", "info");
 				return;
 			}
 			const { commands, directories } = allows.list();
-			if (allows.isEmpty()) {
-				ctx.ui.notify("pi-guru: no session allows yet", "info");
-				return;
-			}
 			const lines = [
+				`Gate level: ${gateLevel}`,
+				allows.isEmpty() ? "No session allows yet" : "",
 				commands.length ? `Commands: ${commands.join(", ")}` : "",
 				directories.length ? `Write dirs: ${directories.join(", ")}` : "",
 			].filter(Boolean);
-			ctx.ui.notify(`pi-guru session allows —\n${lines.join("\n")}`, "info");
+			ctx.ui.notify(`pi-guru —\n${lines.join("\n")}`, "info");
 		},
 	});
+
+	/** Show or set the session gate level for `/gate level`. */
+	async function gateLevelCommand(ctx: ExtensionContext, arg: string | undefined): Promise<void> {
+		if (arg === undefined) {
+			ctx.ui.notify(`pi-guru: gate level is ${gateLevel}`, "info");
+			return;
+		}
+		if (!isGateLevel(arg)) {
+			// A usage error must not vanish under `pi -p`, where notify is a no-op.
+			notify(ctx, `pi-guru: unknown gate level '${arg}' — use ${ALL_GATE_LEVELS.join(", ")}`, "warning");
+			return;
+		}
+		if (!ctx.hasUI) {
+			// The gate level is a supervised-session control; there is nothing to loosen with no UI.
+			notify(ctx, "pi-guru: the gate level needs an interactive session", "warning");
+			return;
+		}
+		// `off` takes effect only after the person types the phrase, like the second menu.
+		if (arg === "off" && !(await confirmStopAsking(ctx))) {
+			ctx.ui.notify("pi-guru: gate level unchanged", "info");
+			return;
+		}
+		const config = loadEffectiveConfig(
+			globalConfigPath,
+			join(ctx.cwd, CONFIG_DIR_NAME, "pi-guru.json"),
+			ctx.isProjectTrusted(),
+		);
+		applyLevel(ctx, arg, config);
+	}
 
 	// /judge — show or set the judge mode and threshold (persisted to the global config).
 	pi.registerCommand("judge", {
@@ -340,7 +477,7 @@ export default function (pi: ExtensionAPI) {
 					`pi-guru judge: ${modeText}${tripped}\nthis session — auto-approved: ${autoApproved}, gated: ${gated}, denied: ${denied}, judge failures: ${failures}`,
 					"info",
 				);
-				updateStatus(ctx, effMode, config.judgeThreshold, judge.counts);
+				updateStatus(ctx, gateLevel, effMode, config.judgeThreshold, judge.counts);
 				return;
 			}
 
@@ -378,7 +515,7 @@ export default function (pi: ExtensionAPI) {
 					? ""
 					: ` (this project tightens it to ${effective.judgeMode === "auto" ? `auto/${effective.judgeThreshold}` : effective.judgeMode})`;
 			ctx.ui.notify(`pi-guru: judge set to ${setText}${effText}`, "info");
-			updateStatus(ctx, effective.judgeMode, effective.judgeThreshold, judge.counts);
+			updateStatus(ctx, gateLevel, effective.judgeMode, effective.judgeThreshold, judge.counts);
 		},
 	});
 }
@@ -466,18 +603,21 @@ function effectiveJudgeMode(configured: JudgeMode, tripped: boolean): JudgeMode 
 	return configured === "auto" && tripped ? "advise" : configured;
 }
 
-/** Update the status line: `judge:<mode>[/<threshold>] a:<n> g:<n> d:<n>`. */
+/**
+ * Update the status line: `judge:<mode>[/<threshold>] a:<n> g:<n> d:<n>`, prefixed
+ * with `gate:<level>` only when the session gate level is not `ask` — so at `ask`
+ * (the default) the line is byte-identical to a build without the gate level.
+ */
 function updateStatus(
 	ctx: ExtensionContext,
+	gateLevel: GateLevel,
 	mode: JudgeMode,
 	threshold: Threshold,
 	counts: JudgeCounts,
 ): void {
 	const modeText = mode === "auto" ? `auto/${threshold}` : mode;
-	ctx.ui.setStatus(
-		"pi-guru",
-		`judge:${modeText} a:${counts.autoApproved} g:${counts.gated} d:${counts.denied}`,
-	);
+	const judgeText = `judge:${modeText} a:${counts.autoApproved} g:${counts.gated} d:${counts.denied}`;
+	ctx.ui.setStatus("pi-guru", gateLevel === "ask" ? judgeText : `gate:${gateLevel} ${judgeText}`);
 }
 
 /**
@@ -496,14 +636,15 @@ function buildJudgeStage(
 	call: NormalizedCall,
 	judge: JudgeState,
 	effMode: JudgeMode,
+	threshold: Threshold,
 	sessionNonce: string,
 	assessment: AssessResult,
 	factsBlock: string | undefined,
+	refreshStatus: () => void,
 ): JudgeStage | undefined {
 	if (effMode === "off") return undefined;
 	if (effMode === "advise" && !ctx.hasUI) return undefined;
 	const mode: "advise" | "auto" = effMode === "auto" ? "auto" : "advise";
-	const threshold = config.judgeThreshold;
 	// The deterministic floor, applied to the verdict below. `undefined` when nothing floors.
 	const floor = floorDecision(assessment.facts);
 
@@ -541,13 +682,13 @@ function buildJudgeStage(
 					"warning",
 				);
 			}
-			updateStatus(ctx, effectiveJudgeMode(config.judgeMode, judge.breaker.tripped), threshold, judge.counts);
+			refreshStatus();
 			return { kind: "auto-approve", verdictLine: verdictBadge(action.verdict) };
 		}
 
 		judge.counts.gated++;
 		if (outcome.available) judge.breaker.record(outcome.verdict.risk, false);
-		updateStatus(ctx, effectiveJudgeMode(config.judgeMode, judge.breaker.tripped), threshold, judge.counts);
+		refreshStatus();
 		return { kind: "gate", header: action.header };
 	};
 }
@@ -623,6 +764,17 @@ function registerSpeechRenderer(pi: ExtensionAPI, kind: SpeechEntry["kind"]): vo
 		const box = new Box(1, 0, (t) => theme.bg("customMessageBg", t));
 		box.addChild(new Text(`${theme.fg("accent", "[pi-guru]")} ${summary}`, 0, 0));
 		if (expanded && data) box.addChild(new Markdown(data.markdown, 0, 0, getMarkdownTheme()));
+		return box;
+	});
+}
+
+/** Register the renderer for a session gate-level change entry. */
+function registerGateLevelRenderer(pi: ExtensionAPI): void {
+	pi.registerEntryRenderer<GateLevelEntry>(`${ENTRY_PREFIX}:gate-level`, (entry, { expanded }, theme) => {
+		const data = entry.data;
+		const box = new Box(1, 0, (t) => theme.bg("customMessageBg", t));
+		box.addChild(new Text(`${theme.fg("accent", "[pi-guru]")} gate level → ${data?.level ?? "?"}`, 0, 0));
+		if (expanded && data?.detail) box.addChild(new Text(theme.fg("dim", data.detail), 0, 0));
 		return box;
 	});
 }

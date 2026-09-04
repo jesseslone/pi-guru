@@ -15,6 +15,7 @@
 
 import type { SessionAllows } from "./allows.ts";
 import type { CommandWords } from "./classify.ts";
+import type { GateLevel } from "./gate-level.ts";
 import type { GateRequest, GateResult } from "./gate-ui.ts";
 import type { HandoffDetails } from "./handoff.ts";
 import type { CompiledRule, HardDenyRule } from "./hard-deny.ts";
@@ -101,7 +102,21 @@ export interface PipelineDeps {
 	sandbox?: SandboxSignal;
 	/** The judge stage; absent when judge mode is off (or advise with no UI — see the entry). */
 	judge?: JudgeStage;
+	/**
+	 * The session gate level is `off`: skip the judge and the gate for change calls and
+	 * approve them, recording a `pi-guru:decision` entry with outcome `auto-approved (gate off)`.
+	 * Hard denies still run (they precede this). Absent/false at every other level.
+	 */
+	gateOff?: boolean;
 	gate: (req: GateRequest) => Promise<GateResult>;
+	/**
+	 * Apply a new session gate level chosen at the gate's second menu and return the
+	 * deps to re-evaluate the pending call under it — so the re-evaluation runs through the same
+	 * pipeline. Returns `null` when the change did not take effect (e.g. an auto level with no
+	 * model), so the call re-runs with the current deps and the gate is presented again. Injected
+	 * by the extension, which owns the session level; absent in unit tests that never change it.
+	 */
+	applyGateLevel?: (level: GateLevel) => PipelineDeps | null;
 	writeHandoff: (details: HandoffDetails) => string;
 	appendEntry: (kind: EntryKind, data: EntryData) => void;
 }
@@ -171,6 +186,20 @@ export async function runPipeline(
 		return { block: true, reason };
 	}
 
+	// 1.5. Gate off — the session gate level is `off`: skip the judge and the gate and
+	//      approve this change call. Hard denies above still ran; only they remain at this level. A
+	//      `pi-guru:decision` entry with outcome `auto-approved (gate off)` keeps scrollback honest
+	//      about what ran.
+	if (deps.gateOff) {
+		deps.appendEntry("decision", {
+			toolName: call.toolName,
+			detail: call.detail,
+			outcome: "auto-approved (gate off)",
+			timestamp: now,
+		});
+		return undefined;
+	}
+
 	// 2. Session allow — a remembered approval passes silently.
 	if (matchesAllow(call, deps.allows, deps.cwd)) {
 		return undefined;
@@ -220,6 +249,14 @@ export async function runPipeline(
 
 	// 5. Gate — ask a person, showing the judge's verdict in the header when present.
 	const result = await deps.gate({ title: call.title, detail: call.detail, header });
+	// The person changed the session gate level from the second menu: apply it and
+	// re-evaluate this same call under the new level through the pipeline — an auto level judges it,
+	// off approves it. A `null` from `applyGateLevel` (the change did not take effect) re-runs under
+	// the current deps, presenting the gate again.
+	if (result.decision === "change-level") {
+		const nextDeps = deps.applyGateLevel?.(result.level) ?? null;
+		return runPipeline(call, nextDeps ?? deps);
+	}
 	if (result.decision === "deny") {
 		deps.appendEntry("decision", {
 			toolName: call.toolName,

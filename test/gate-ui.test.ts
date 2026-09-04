@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExplainStep } from "../src/explain.ts";
-import { type Explainer, type GateContext, gateItems, presentGate } from "../src/gate-ui.ts";
+import {
+	confirmStopAsking,
+	type Explainer,
+	type GateContext,
+	gateItems,
+	presentGate,
+} from "../src/gate-ui.ts";
 
 /** A fake ctx that scripts the person's choice through ctx.ui.select and ctx.ui.input. */
 function fakeCtx(opts: { pick?: string; reason?: string }): GateContext {
@@ -53,6 +59,83 @@ describe("gateItems", () => {
 		const items = gateItems(true, "fundamental");
 		expect(items[0].value).toBe("explain");
 		expect(items[0].description).toContain("fundamental");
+	});
+
+	it("appends Change how pi-guru asks… as the last choice, never the default", () => {
+		const values = gateItems(true, "fundamental", true).map((i) => i.value);
+		expect(values).toEqual(["explain", "approve", "approve-session", "deny", "deny-reason", "change-level"]);
+		// last, below Deny with a reason
+		expect(values.at(-1)).toBe("change-level");
+	});
+});
+
+describe("confirmStopAsking", () => {
+	const inputCtx = (typed: string | undefined): GateContext =>
+		({ mode: "rpc", ui: { input: vi.fn(async () => typed) } }) as unknown as GateContext;
+
+	it("accepts the exact phrase, case- and space-insensitive", async () => {
+		expect(await confirmStopAsking(inputCtx("stop asking"))).toBe(true);
+		expect(await confirmStopAsking(inputCtx("  Stop Asking  "))).toBe(true);
+	});
+
+	it("rejects anything else, including a cancel", async () => {
+		expect(await confirmStopAsking(inputCtx("stop"))).toBe(false);
+		expect(await confirmStopAsking(inputCtx(undefined))).toBe(false);
+	});
+});
+
+describe("presentGate — second menu", () => {
+	const request = { title: "Run this command?", detail: "rm build/" };
+
+	/** A fake ctx scripting an ordered sequence of ui.select picks and a fixed ui.input reply. */
+	function menuCtx(picks: (string | undefined)[], typed?: string) {
+		let i = 0;
+		const ctx = {
+			mode: "rpc",
+			ui: {
+				select: vi.fn(async () => picks[i++]),
+				input: vi.fn(async () => typed),
+				notify: vi.fn(),
+			},
+		} as unknown as GateContext;
+		return ctx;
+	}
+
+	it("opens the second menu and returns change-level for an auto level", async () => {
+		const ctx = menuCtx(["Change how pi-guru asks…", "Let the judge approve low-risk changes this session"]);
+		const res = await presentGate(ctx, request, { gateLevel: "ask" });
+		expect(res).toEqual({ decision: "change-level", level: "auto-low" });
+	});
+
+	it("marks the current level and can return to ask", async () => {
+		const ctx = menuCtx(["Change how pi-guru asks…", "Keep asking (current)"]);
+		const res = await presentGate(ctx, request, { gateLevel: "ask" });
+		expect(res).toEqual({ decision: "change-level", level: "ask" });
+	});
+
+	it("off takes effect only after 'stop asking' is typed", async () => {
+		const ctx = menuCtx(
+			["Change how pi-guru asks…", "Stop asking this session (hard denies stay)"],
+			"stop asking",
+		);
+		const res = await presentGate(ctx, request, { gateLevel: "ask" });
+		expect(res).toEqual({ decision: "change-level", level: "off" });
+	});
+
+	it("an unconfirmed off returns to the gate rather than changing the level", async () => {
+		// off chosen, wrong phrase typed → loop back to the gate, where Approve is picked next.
+		const ctx = menuCtx(
+			["Change how pi-guru asks…", "Stop asking this session (hard denies stay)", "Approve"],
+			"nope",
+		);
+		const res = await presentGate(ctx, request, { gateLevel: "ask" });
+		expect(res).toEqual({ decision: "approve" });
+	});
+
+	it("Back from the second menu returns to the gate", async () => {
+		const ctx = menuCtx(["Change how pi-guru asks…", "Back", "Deny"]);
+		const res = await presentGate(ctx, request, { gateLevel: "ask" });
+		expect(res).toEqual({ decision: "deny", reason: "pi-guru: denied at the gate" });
 	});
 });
 

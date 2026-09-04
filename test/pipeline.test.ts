@@ -244,6 +244,73 @@ describe("runPipeline — judge stage", () => {
 	});
 });
 
+describe("runPipeline — gate off", () => {
+	it("approves a change call and records auto-approved (gate off), skipping the gate", async () => {
+		const gate = vi.fn(async (): Promise<GateResult> => ({ decision: "deny", reason: "x" }));
+		const deps = makeDeps({ gateOff: true, gate });
+		const res = await runPipeline(bashCall("echo hi > x"), deps);
+		expect(res).toBeUndefined();
+		expect(gate).not.toHaveBeenCalled();
+		const [kind, data] = deps.entries.at(-1) ?? ["", {}];
+		expect(kind).toBe("decision");
+		expect((data as { outcome: string }).outcome).toBe("auto-approved (gate off)");
+	});
+
+	it("still hard-denies at gate off (hard denies precede it)", async () => {
+		const deps = makeDeps({ gateOff: true });
+		const res = await runPipeline(bashCall("rm -rf /"), deps);
+		expect(res?.reason).toMatch(/hard deny/);
+		expect(deps.entries[0][0]).toBe("hard-deny");
+	});
+});
+
+describe("runPipeline — gate-level re-evaluation", () => {
+	it("re-evaluates the pending call through the pipeline under the new level (auto approves it)", async () => {
+		let gateCalls = 0;
+		const gate = vi.fn(async (): Promise<GateResult> => {
+			gateCalls++;
+			// First pass: the person opens the second menu and picks auto-low.
+			return gateCalls === 1
+				? { decision: "change-level", level: "auto-low" }
+				: { decision: "deny", reason: "x" };
+		});
+		const autoJudge = vi.fn(async () => ({ kind: "auto-approve" as const, verdictLine: "[LOW RISK] fine" }));
+		const deps = makeDeps({ gate });
+		// applyGateLevel yields deps whose judge auto-approves — the same runPipeline runs again.
+		deps.applyGateLevel = () => ({ ...deps, judge: autoJudge });
+		const res = await runPipeline(bashCall("echo hi"), deps);
+		expect(res).toBeUndefined();
+		expect(autoJudge).toHaveBeenCalledOnce();
+		expect(gate).toHaveBeenCalledOnce(); // the re-eval auto-approved; the gate was not shown again
+		expect(deps.entries.at(-1)?.[0]).toBe("auto-approve");
+	});
+
+	it("off chosen at the gate re-evaluates and approves via the gate-off branch", async () => {
+		const gate = vi.fn(async (): Promise<GateResult> => ({ decision: "change-level", level: "off" }));
+		const deps = makeDeps({ gate });
+		deps.applyGateLevel = () => ({ ...deps, gateOff: true });
+		const res = await runPipeline(bashCall("echo hi > x"), deps);
+		expect(res).toBeUndefined();
+		const [kind, data] = deps.entries.at(-1) ?? ["", {}];
+		expect(kind).toBe("decision");
+		expect((data as { outcome: string }).outcome).toBe("auto-approved (gate off)");
+	});
+
+	it("a rejected change (applyGateLevel returns null) re-presents the gate with the same deps", async () => {
+		let gateCalls = 0;
+		const gate = vi.fn(async (): Promise<GateResult> => {
+			gateCalls++;
+			return gateCalls === 1 ? { decision: "change-level", level: "auto-low" } : { decision: "approve" };
+		});
+		const deps = makeDeps({ gate });
+		deps.applyGateLevel = vi.fn(() => null); // e.g. auto requested with no model — stay put
+		const res = await runPipeline(bashCall("echo hi"), deps);
+		expect(res).toBeUndefined();
+		expect(gate).toHaveBeenCalledTimes(2); // gate shown again after the no-op change
+		expect(deps.applyGateLevel).toHaveBeenCalledWith("auto-low");
+	});
+});
+
 describe("runPipeline — unknown change tool", () => {
 	it("always gates an unknown tool (no allow can match)", async () => {
 		const gate = vi.fn(async (): Promise<GateResult> => ({ decision: "deny", reason: "r" }));

@@ -16,6 +16,10 @@ _Avoid_: safe command, query
 The approval prompt shown before a change call runs. Offers Explain, Approve, Approve for this session, Deny, and Deny with a reason. Explain is the default unless the explanation level is off.
 _Avoid_: permission popup, confirm dialog
 
+**Gate level**:
+How much pi-guru asks during this session only: ask (every change call gates), auto-low or auto-medium (the judge approves up to that risk), or off (only hard denies remain). Set from the gate's second menu or /gate level; never written to config; resets when the session ends.
+_Avoid_: yolo, bypass, permission mode
+
 **Session allow**:
 A remembered approval that lets later change calls with the same command word, or writes in the same directory, pass the gate for the rest of the session.
 _Avoid_: whitelist, always allow, trust

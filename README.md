@@ -39,7 +39,7 @@ If pi-guru can't read a command well enough to understand it, it asks rather tha
 
 The gate is written for you, the person watching the agent, not for the agent itself. A change call is any tool call that can change something on the computer, like a bash command or a file write or a file edit or any tool call that pi doesn't know is read-only. Before a change call runs, the gate appears and offers five choices: explain, approve, approve for this session, deny, and deny with a reason.
 
-Explain is the default and pressing enter explains the command before it runs. Approve for this session remembers the word of the command, like git or npm or the directory that's being written to, so it doesn't ask the same question every time and the interruptions taper off as you gain trust. And deny with a reason sends the reason back to the agent, which gives it a chance to adjust its approach rather than guessing again.
+Explain is the default and pressing enter explains the command before it runs. Approve for this session remembers the word of the command, like git or npm or the directory that's being written to, so it doesn't ask the same question every time and the interruptions taper off as you gain trust. And deny with a reason sends the reason back to the agent, which gives it a chance to adjust its approach rather than guessing again. A last choice, Change how pi-guru asks…, opens a second menu for this session only: let the judge approve low-risk changes, let it approve low and medium, or stop asking altogether after typing a confirmation. Hard denies stay on in every case, and the setting resets when the session ends.
 
 ### What the gate looks like
 
@@ -107,7 +107,8 @@ The session model writes explanations for commands it has not yet run. The promp
 | `/judge` | Show the judge mode, threshold, and this session's counts. |
 | `/judge advise` | Judge rates every change call; a person still decides. |
 | `/judge auto medium` | Judge may approve up to `low` or `medium` risk on your behalf. `/judge off` turns it off. |
-| `/gate` | List this session's allows. `/gate clear` forgets them. |
+| `/gate` | Show the session gate level and allows. `/gate clear` forgets the allows. |
+| `/gate level ask\|auto-low\|auto-medium\|off` | Change how much pi-guru asks for the rest of this session; `off` asks you to type a confirmation. |
 | `/judge-bench run [provider/model] [--passes 3] [--prompt v2] [--facts off]` | Benchmark the judge on the configured model; results stay on this machine. |
 | `/judge-bench compare`, `show <run>`, `diff <a> <b>`, `rescore <run>` | Compare, inspect, and re-read prior runs. |
 
