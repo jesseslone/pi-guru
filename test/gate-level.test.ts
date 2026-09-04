@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { type GateLevel, isGateLevel, resolveSessionJudge } from "../src/gate-level.ts";
+import {
+	breakerDropped,
+	effectiveJudgeMode,
+	type GateLevel,
+	isGateLevel,
+	resolveSessionJudge,
+} from "../src/gate-level.ts";
 import type { JudgeMode, Threshold } from "../src/judge.ts";
 
 const config = (judgeMode: JudgeMode, judgeThreshold: Threshold = "low") => ({ judgeMode, judgeThreshold });
@@ -41,6 +47,49 @@ describe("resolveSessionJudge — mapping", () => {
 	it("off sets gate-off and does not run the judge", () => {
 		const r = resolveSessionJudge("off", config("auto", "medium"));
 		expect(r).toMatchObject({ gateOff: true, appliedLevel: "off", capped: false });
+	});
+});
+
+describe("effectiveJudgeMode — the breaker only applies at gate level ask", () => {
+	it("a session auto level ignores a tripped breaker — the mode stays auto", () => {
+		for (const level of ["auto-low", "auto-medium"] as GateLevel[]) {
+			expect(effectiveJudgeMode("auto", true, level)).toBe("auto");
+			expect(effectiveJudgeMode("auto", false, level)).toBe("auto");
+		}
+	});
+
+	it("configured auto at ask still drops to advise when the breaker has tripped", () => {
+		expect(effectiveJudgeMode("auto", true, "ask")).toBe("advise");
+		expect(effectiveJudgeMode("auto", false, "ask")).toBe("auto");
+	});
+
+	it("a non-auto configured mode is never changed by the breaker", () => {
+		for (const level of ["ask", "auto-low", "auto-medium", "off"] as GateLevel[]) {
+			expect(effectiveJudgeMode("advise", true, level)).toBe("advise");
+			expect(effectiveJudgeMode("off", true, level)).toBe("off");
+		}
+	});
+});
+
+describe("breakerDropped — only a configured auto dropped at ask counts", () => {
+	it("is true only for configured auto, tripped, at gate level ask", () => {
+		expect(breakerDropped("auto", true, "ask")).toBe(true);
+	});
+
+	it("is false when the breaker has not tripped", () => {
+		expect(breakerDropped("auto", false, "ask")).toBe(false);
+	});
+
+	it("is false under a session auto level, tripped or not — that level ignores the breaker", () => {
+		for (const level of ["auto-low", "auto-medium"] as GateLevel[]) {
+			expect(breakerDropped("auto", true, level)).toBe(false);
+			expect(breakerDropped("auto", false, level)).toBe(false);
+		}
+	});
+
+	it("is false for a non-auto configured mode", () => {
+		expect(breakerDropped("advise", true, "ask")).toBe(false);
+		expect(breakerDropped("off", true, "ask")).toBe(false);
 	});
 });
 

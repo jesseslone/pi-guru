@@ -458,6 +458,17 @@ export class CircuitBreaker {
 		return this.tripped;
 	}
 
+	/**
+	 * Clear every counter, so the breaker is un-tripped again. The extension calls this whenever a
+	 * person sets the judge mode (`/judge`) or the session gate level (the gate's second menu or
+	 * `/gate level`, the design notes): both are explicit, present-person choices, so a prior trip must not
+	 * linger over the fresh one.
+	 */
+	reset(): void {
+		this.consecutiveMedium = 0;
+		this.window = [];
+	}
+
 	/** Whether the breaker has tripped — the session should be in advise from here on. */
 	get tripped(): boolean {
 		if (this.consecutiveMedium >= CircuitBreaker.MAX_MEDIUM_STREAK) return true;

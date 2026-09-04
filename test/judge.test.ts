@@ -241,6 +241,29 @@ describe("CircuitBreaker", () => {
 		// Nine fresh auto-approvals still under ten in the (now mostly-gated) window.
 		for (let i = 0; i < 9; i++) expect(b.record("low", true)).toBe(false);
 	});
+
+	it("reset() un-trips a tripped breaker (setting a gate level or /judge, the design notes)", () => {
+		const b = new CircuitBreaker();
+		b.record("medium", true);
+		b.record("medium", true);
+		expect(b.record("medium", true)).toBe(true); // tripped on the medium streak
+		expect(b.tripped).toBe(true);
+		b.reset();
+		expect(b.tripped).toBe(false);
+		// The medium streak is cleared too: two fresh mediums do not re-trip immediately.
+		expect(b.record("medium", true)).toBe(false);
+		expect(b.record("medium", true)).toBe(false);
+	});
+
+	it("reset() clears the fifty-call window, not just the medium streak", () => {
+		const b = new CircuitBreaker();
+		for (let i = 0; i < 9; i++) b.record("low", true);
+		expect(b.record("low", true)).toBe(true); // the tenth auto-approval trips the window rule
+		b.reset();
+		expect(b.tripped).toBe(false);
+		// Nine fresh low auto-approvals are back under ten — the old window is gone.
+		for (let i = 0; i < 9; i++) expect(b.record("low", true)).toBe(false);
+	});
 });
 
 describe("runJudge", () => {

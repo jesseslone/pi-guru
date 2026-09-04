@@ -51,6 +51,8 @@ import { makeExplainer } from "../src/explain.ts";
 import { randomNonce } from "../src/fence.ts";
 import {
 	ALL_GATE_LEVELS,
+	breakerDropped,
+	effectiveJudgeMode,
 	type GateLevel,
 	isGateLevel,
 	type ProjectJudgeView,
@@ -181,6 +183,11 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		gateLevel = resolve.appliedLevel;
+		// Setting any gate level is an explicit, present-person choice: clear a prior circuit-breaker
+		// trip so it does not linger over the fresh choice. A session auto level ignores the
+		// breaker anyway; this also gives a return to `ask` a clean slate.
+		judge.breaker.reset();
+		judge.notifiedTrip = false;
 		if (resolve.capped) {
 			ctx.ui.notify(
 				`pi-guru: this project caps the gate level at ${resolve.appliedLevel} (requested ${requested})`,
@@ -197,9 +204,10 @@ export default function (pi: ExtensionAPI) {
 		updateStatus(
 			ctx,
 			gateLevel,
-			effectiveJudgeMode(resolve.mode, judge.breaker.tripped),
+			effectiveJudgeMode(resolve.mode, judge.breaker.tripped, gateLevel),
 			resolve.threshold,
 			judge.counts,
+			breakerDropped(resolve.mode, judge.breaker.tripped, gateLevel),
 		);
 		ctx.ui.notify(`pi-guru: gate level set to ${gateLevel}`, "info");
 		return true;
@@ -227,9 +235,10 @@ export default function (pi: ExtensionAPI) {
 				updateStatus(
 					ctx,
 					gateLevel,
-					effectiveJudgeMode(r.mode, judge.breaker.tripped),
+					effectiveJudgeMode(r.mode, judge.breaker.tripped, gateLevel),
 					r.threshold,
 					judge.counts,
+					breakerDropped(r.mode, judge.breaker.tripped, gateLevel),
 				);
 			};
 
@@ -281,7 +290,13 @@ export default function (pi: ExtensionAPI) {
 			// level through the pipeline. At `ask` this resolves to the config's own judge (byte-identical).
 			const buildPipelineDeps = (): PipelineDeps => {
 				const resolve = resolveSessionJudge(gateLevel, config, projectView);
-				const effMode = effectiveJudgeMode(resolve.mode, judge.breaker.tripped);
+				const effMode = effectiveJudgeMode(resolve.mode, judge.breaker.tripped, gateLevel);
+				// The breaker only applies at gate level `ask`: a session auto level is an
+				// explicit choice, so the breaker neither drops it nor fires a "dropped to advise" notice.
+				// `dropped` is the current dropped state (for the gate header), false until the breaker
+				// actually trips under `ask`.
+				const breakerApplies = gateLevel === "ask";
+				const dropped = breakerDropped(resolve.mode, judge.breaker.tripped, gateLevel);
 				refreshStatus();
 				return {
 					rules,
@@ -300,6 +315,8 @@ export default function (pi: ExtensionAPI) {
 						assessment,
 						factsBlock,
 						refreshStatus,
+						breakerApplies,
+						dropped,
 					),
 					gate: (req) => presentGate(ctx, req, { ...gateOptions, gateLevel }),
 					applyGateLevel: (requested) => (applyLevel(ctx, requested, config) ? buildPipelineDeps() : null),
@@ -468,16 +485,20 @@ export default function (pi: ExtensionAPI) {
 			);
 
 			if (tokens.length === 0) {
-				const effMode = effectiveJudgeMode(config.judgeMode, judge.breaker.tripped);
+				const effMode = effectiveJudgeMode(config.judgeMode, judge.breaker.tripped, gateLevel);
 				const modeText = effMode === "auto" ? `auto (threshold ${config.judgeThreshold})` : effMode;
-				const tripped =
-					config.judgeMode === "auto" && judge.breaker.tripped ? " — dropped to advise this session" : "";
+				// The breaker drop is reported only when it actually applies (configured auto at gate
+				// level `ask`, the design notes); a session auto level ignores a tripped breaker.
+				const dropped = breakerDropped(config.judgeMode, judge.breaker.tripped, gateLevel);
+				const trippedText = dropped
+					? " — dropped to advise this session (/gate level auto-medium or /judge auto)"
+					: "";
 				const { autoApproved, gated, denied, failures } = judge.counts;
 				ctx.ui.notify(
-					`pi-guru judge: ${modeText}${tripped}\nthis session — auto-approved: ${autoApproved}, gated: ${gated}, denied: ${denied}, judge failures: ${failures}`,
+					`pi-guru judge: ${modeText}${trippedText}\nthis session — auto-approved: ${autoApproved}, gated: ${gated}, denied: ${denied}, judge failures: ${failures}`,
 					"info",
 				);
-				updateStatus(ctx, gateLevel, effMode, config.judgeThreshold, judge.counts);
+				updateStatus(ctx, gateLevel, effMode, config.judgeThreshold, judge.counts, dropped);
 				return;
 			}
 
@@ -500,7 +521,7 @@ export default function (pi: ExtensionAPI) {
 			// An explicit set is the person overriding: clear any circuit-breaker trip so a
 			// freshly chosen auto mode takes effect (the counts stay — they are the session record).
 			setJudgeInConfig(globalConfigPath, mode, threshold);
-			judge.breaker = new CircuitBreaker();
+			judge.breaker.reset();
 			judge.notifiedTrip = false;
 
 			// A project config may only tighten; report what will actually take effect.
@@ -598,15 +619,13 @@ function makeJudgeCompleter(ctx: ExtensionContext, model: SessionModel): Complet
 	};
 }
 
-/** The judge mode actually in force: a tripped circuit breaker drops auto to advise. */
-function effectiveJudgeMode(configured: JudgeMode, tripped: boolean): JudgeMode {
-	return configured === "auto" && tripped ? "advise" : configured;
-}
-
 /**
  * Update the status line: `judge:<mode>[/<threshold>] a:<n> g:<n> d:<n>`, prefixed
  * with `gate:<level>` only when the session gate level is not `ask` — so at `ask`
- * (the default) the line is byte-identical to a build without the gate level.
+ * (the default) the line is byte-identical to a build without the gate level. When the circuit
+ * breaker has dropped a configured auto to advise, the mode reads `auto→advise` so the
+ * drop is visible at a glance; `dropped` is false everywhere except that state (only reachable at
+ * `ask`), keeping every other line byte-identical.
  */
 function updateStatus(
 	ctx: ExtensionContext,
@@ -614,8 +633,9 @@ function updateStatus(
 	mode: JudgeMode,
 	threshold: Threshold,
 	counts: JudgeCounts,
+	dropped = false,
 ): void {
-	const modeText = mode === "auto" ? `auto/${threshold}` : mode;
+	const modeText = dropped ? "auto→advise" : mode === "auto" ? `auto/${threshold}` : mode;
 	const judgeText = `judge:${modeText} a:${counts.autoApproved} g:${counts.gated} d:${counts.denied}`;
 	ctx.ui.setStatus("pi-guru", gateLevel === "ask" ? judgeText : `gate:${gateLevel} ${judgeText}`);
 }
@@ -641,6 +661,12 @@ function buildJudgeStage(
 	assessment: AssessResult,
 	factsBlock: string | undefined,
 	refreshStatus: () => void,
+	// The breaker applies only at gate level `ask`: elsewhere a trip neither notifies nor
+	// changes the header, because a session auto level was an explicit, present-person choice.
+	breakerApplies: boolean,
+	// True when the breaker has already dropped a configured auto to advise this session, so the gate
+	// header on this (and every later) gate says so.
+	dropped: boolean,
 ): JudgeStage | undefined {
 	if (effMode === "off") return undefined;
 	if (effMode === "advise" && !ctx.hasUI) return undefined;
@@ -675,10 +701,12 @@ function buildJudgeStage(
 		if (action.kind === "auto-approve") {
 			judge.counts.autoApproved++;
 			const tripped = judge.breaker.record(action.verdict.risk, true);
-			if (tripped && !judge.notifiedTrip) {
+			// Only report the drop when the breaker actually applies (configured auto at gate level
+			// `ask`, the design notes) — a session auto level ignores the trip, so it must not say otherwise.
+			if (tripped && breakerApplies && !judge.notifiedTrip) {
 				judge.notifiedTrip = true;
 				ctx.ui.notify(
-					"pi-guru: judge dropped to advise for this session (circuit breaker) — you'll decide at the gate",
+					"pi-guru: judge dropped to advise for this session (circuit breaker) — you'll decide at the gate. To resume auto-approvals: /gate level auto-medium or /judge auto",
 					"warning",
 				);
 			}
@@ -689,7 +717,10 @@ function buildJudgeStage(
 		judge.counts.gated++;
 		if (outcome.available) judge.breaker.record(outcome.verdict.risk, false);
 		refreshStatus();
-		return { kind: "gate", header: action.header };
+		// While the breaker holds the session in advise, the gate header says so, so the
+		// person knows why they are deciding this and how it changed.
+		const header = dropped ? `judge dropped to advise (circuit breaker) · ${action.header}` : action.header;
+		return { kind: "gate", header };
 	};
 }
 

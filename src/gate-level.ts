@@ -13,6 +13,29 @@ import type { JudgeMode, Threshold } from "./judge.ts";
 /** How much pi-guru asks during this session only (CONTEXT.md). */
 export type GateLevel = "ask" | "auto-low" | "auto-medium" | "off";
 
+/**
+ * The judge mode actually in force. A tripped judge circuit breaker drops a
+ * configured `auto` to `advise` — but only at gate level `ask`, where the auto came from config and
+ * nobody chose it for this session. A session auto level (`auto-low`/`auto-medium`) is an explicit,
+ * present-person choice, so the breaker does not undo it: the effective mode stays `auto` even when
+ * the breaker has tripped. (The extension also resets the breaker whenever a gate level is set, so a
+ * later return to `ask` starts fresh.)
+ */
+export function effectiveJudgeMode(configured: JudgeMode, tripped: boolean, level: GateLevel): JudgeMode {
+	if (level !== "ask") return configured;
+	return configured === "auto" && tripped ? "advise" : configured;
+}
+
+/**
+ * Whether the circuit breaker has dropped a configured `auto` to `advise` for this session (issue
+ * #24) — the state the extension must surface: the one-time notice, "judge dropped to advise" on the
+ * next gate header, and on the status line. True only at gate level `ask` with a configured `auto`
+ * and a tripped breaker; a session auto level never enters this state.
+ */
+export function breakerDropped(configured: JudgeMode, tripped: boolean, level: GateLevel): boolean {
+	return configured === "auto" && effectiveJudgeMode(configured, tripped, level) === "advise";
+}
+
 /** Every gate level, in ascending autonomy — for command validation and cap laddering. */
 export const ALL_GATE_LEVELS: readonly GateLevel[] = ["ask", "auto-low", "auto-medium", "off"];
 
